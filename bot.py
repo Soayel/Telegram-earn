@@ -75,7 +75,7 @@ async def webview_url(client, raw):
     theme = types.DataJSON(data='{"bg_color":"#ffffff","text_color":"#000000",'
                                 '"button_color":"#3390ec","button_text_color":"#ffffff"}')
     try:
-        if isinstance(raw, types.KeyboardButtonWebView):
+        if type(raw).__name__ == "KeyboardButtonWebView":
             res = await client(functions.messages.RequestWebViewRequest(
                 peer=bot, bot=bot, platform="android", url=raw.url, theme_params=theme))
         else:
@@ -87,23 +87,50 @@ async def webview_url(client, raw):
         return None
 
 
+def buttons_of(msg):
+    """Raw buttons of a message (no Telethon helper classes)."""
+    markup = getattr(msg, "reply_markup", None)
+    out = []
+    for row in getattr(markup, "rows", None) or []:
+        out.extend(getattr(row, "buttons", None) or [])
+    return out
+
+
 async def find_url(client, msg):
     """URL from a link button, a Mini App button, or the message text."""
-    for row in msg.buttons or []:
-        for b in row:
-            raw = b.button
-            if isinstance(raw, types.KeyboardButtonUrl):
-                return raw.url
-            if isinstance(raw, (types.KeyboardButtonWebView,
-                                types.KeyboardButtonSimpleWebView)):
-                if BUTTON_TEXT and BUTTON_TEXT.lower() not in (b.text or "").lower():
-                    continue
-                log.info("Opening Mini App button: %s", b.text)
-                url = await webview_url(client, raw)
-                if url:
-                    return url
+    for raw in buttons_of(msg):
+        kind = type(raw).__name__
+        if kind == "KeyboardButtonUrl":
+            return raw.url
+        if kind in ("KeyboardButtonWebView", "KeyboardButtonSimpleWebView"):
+            text = getattr(raw, "text", "") or ""
+            if BUTTON_TEXT and BUTTON_TEXT.lower() not in text.lower():
+                continue
+            log.info("Opening Mini App button: %s", text)
+            url = await webview_url(client, raw)
+            if url:
+                return url
     m = re.search(r"https?://\S+", msg.text or "")
     return m.group(0) if m else None
+
+
+async def press_button(client, msg):
+    """Press a normal (callback / plain) button. Returns a URL if the answer has one."""
+    bot = await client.get_input_entity(BOT)
+    cands = [r for r in buttons_of(msg)
+             if type(r).__name__ in ("KeyboardButtonCallback", "KeyboardButton")]
+    if BUTTON_TEXT:
+        cands = [r for r in cands if BUTTON_TEXT.lower() in (r.text or "").lower()]
+    if not cands:
+        return None
+    raw = cands[0]
+    log.info("Pressing button: %s", raw.text)
+    if type(raw).__name__ == "KeyboardButtonCallback":
+        res = await client(functions.messages.GetBotCallbackAnswerRequest(
+            peer=bot, msg_id=msg.id, data=raw.data))
+        return getattr(res, "url", None)
+    await client.send_message(BOT, raw.text)
+    return None
 
 
 async def get_link(client):
@@ -124,18 +151,13 @@ async def get_link(client):
             if url:
                 return url
 
-            if msg.buttons:                              # callback button: press it
+            if buttons_of(msg):
                 try:
-                    if BUTTON_TEXT:
-                        log.info("Pressing button: %s", BUTTON_TEXT)
-                        res = await msg.click(text=BUTTON_TEXT)
-                    else:
-                        log.info("Pressing first button")
-                        res = await msg.click(0, 0)
-                    if getattr(res, "url", None):
-                        return res.url
+                    url = await press_button(client, msg)
+                    if url:
+                        return url
                 except Exception as e:
-                    log.warning("Button click failed: %r", e)
+                    log.warning("Button press failed: %r", e)
                 await asyncio.sleep(random.uniform(1, 2))
                 fresh = await client.get_messages(BOT, ids=msg.id)   # may be edited
                 url = await find_url(client, fresh) if fresh else None
@@ -149,6 +171,8 @@ async def main():
     client = TelegramClient(session, API_ID, API_HASH)
     await client.start()          # first run asks phone + code
     log.info("Telegram connected")
+    import telethon
+    log.info("Script v6 | Telethon %s", getattr(telethon, "__version__", "?"))
 
     await client.send_message(BOT, "/start")
     await asyncio.sleep(random.uniform(3, 7))
@@ -221,7 +245,7 @@ async def main():
             await asyncio.sleep(e.seconds + random.randint(60, 180))
             continue
         except Exception as e:
-            log.warning("Error: %r", e)
+            log.warning("Error: %r", e, exc_info=True)
 
         # random pause between rounds
         # mostly short pauses, occasionally a slightly longer one (like a real person)
