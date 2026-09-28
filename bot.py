@@ -4,6 +4,8 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 from telethon.tl import types, functions
+from telethon import utils as tg_utils
+from urllib.parse import parse_qs
 
 try:
     from playwright.async_api import async_playwright
@@ -96,12 +98,79 @@ def buttons_of(msg):
     return out
 
 
+TME_RE = re.compile(
+    r"^https?://(?:www\.)?(?:t|telegram)\.me/([A-Za-z0-9_]+)(?:/([A-Za-z0-9_]+))?/?(?:\?(.*))?$")
+_started = set()
+
+
+def urls_of(msg):
+    """Every URL in a message: link buttons, hidden hyperlinks, plain text."""
+    urls = []
+    for raw in buttons_of(msg):
+        if type(raw).__name__ in ("KeyboardButtonUrl", "KeyboardButtonUrlAuth"):
+            urls.append(raw.url)
+    try:
+        for ent, txt in msg.get_entities_text():
+            n = type(ent).__name__
+            if n == "MessageEntityTextUrl":
+                urls.append(ent.url)
+            elif n == "MessageEntityUrl":
+                urls.append(txt if txt.startswith("http") else "https://" + txt)
+    except Exception:
+        pass
+    urls += re.findall(r"https?://[^\s)>\]]+", msg.raw_text or "")
+    out = []
+    for u in urls:
+        u = (u or "").strip().rstrip(".,")
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+async def resolve_url(client, url):
+    """Turn Telegram deep links into real Mini App web URLs; keep normal links."""
+    m = TME_RE.match(url)
+    if not m:
+        return url
+    name, app, query = m.groups()
+    params = parse_qs(query or "", keep_blank_values=True)
+    startapp = params.get("startapp", [None])[0]
+    start = params.get("start", [None])[0]
+    try:
+        if app and not app.isdigit() and name.lower() not in (
+                "c", "joinchat", "addstickers", "addemoji", "share", "proxy", "socks"):
+            peer = await client.get_input_entity(name)
+            res = await client(functions.messages.RequestAppWebViewRequest(
+                peer=peer,
+                app=types.InputBotAppShortName(
+                    bot_id=tg_utils.get_input_user(peer), short_name=app),
+                platform="android", write_allowed=True,
+                start_param=startapp or None))
+            log.info("Resolved Mini App link %s/%s", name, app)
+            return res.url
+        if startapp is not None and not app:
+            peer = await client.get_input_entity(name)
+            res = await client(functions.messages.RequestMainWebViewRequest(
+                peer=peer, bot=tg_utils.get_input_user(peer), platform="android",
+                start_param=startapp or None))
+            log.info("Resolved main Mini App link %s", name)
+            return res.url
+        if start is not None and name.lower() == BOT.lstrip("@").lower():
+            if url not in _started:
+                _started.add(url)
+                log.info("Deep link: sending /start %s", start)
+                await client.send_message(BOT, "/start " + start)
+            return None
+    except Exception as e:
+        log.warning("Could not resolve %s: %r", url, e)
+        return None
+    return url
+
+
 async def find_url(client, msg):
-    """URL from a link button, a Mini App button, or the message text."""
+    """Mini App button first, then any link (button / hidden link / text)."""
     for raw in buttons_of(msg):
         kind = type(raw).__name__
-        if kind == "KeyboardButtonUrl":
-            return raw.url
         if kind in ("KeyboardButtonWebView", "KeyboardButtonSimpleWebView"):
             text = getattr(raw, "text", "") or ""
             if BUTTON_TEXT and BUTTON_TEXT.lower() not in text.lower():
@@ -110,8 +179,11 @@ async def find_url(client, msg):
             url = await webview_url(client, raw)
             if url:
                 return url
-    m = re.search(r"https?://\S+", msg.text or "")
-    return m.group(0) if m else None
+    for u in urls_of(msg):
+        url = await resolve_url(client, u)
+        if url:
+            return url
+    return None
 
 
 async def press_button(client, msg):
@@ -133,36 +205,48 @@ async def press_button(client, msg):
     return None
 
 
-async def get_link(client):
-    """Send TEXT, open the Mini App button / press the button, return the URL."""
-    async with client.conversation(BOT, timeout=45) as conv:
-        async with client.action(BOT, "typing"):
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-        await conv.send_message(TEXT)
-        for _ in range(4):
-            try:
-                msg = await conv.get_response()
-            except asyncio.TimeoutError:
-                log.info("Bot sent no (more) messages")
-                break
-            await asyncio.sleep(random.uniform(0.8, 2.5))   # "reading" time
+async def dump_chat(client, n=5):
+    """Log the last messages of the bot chat (for debugging)."""
+    try:
+        msgs = await client.get_messages(BOT, limit=n)
+        for m in reversed(msgs):
+            kinds = ["%s:%s" % (type(b).__name__, getattr(b, "text", "")) for b in buttons_of(m)]
+            log.info("CHAT %s id=%s text=%r buttons=%s urls=%s",
+                     "ME" if m.out else "BOT", m.id, (m.raw_text or "")[:80], kinds, urls_of(m))
+    except Exception as e:
+        log.warning("dump failed: %r", e)
 
-            url = await find_url(client, msg)
+
+async def get_link(client):
+    """Send TEXT, then watch the chat for the bot's reply; open/press its button."""
+    async with client.action(BOT, "typing"):
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+    _started.clear()
+    sent = await client.send_message(BOT, TEXT)
+    log.info("Sent: %r", TEXT[:40])
+
+    seen = set()
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        await asyncio.sleep(random.uniform(1, 2))
+        msgs = await client.get_messages(BOT, limit=6, min_id=sent.id)
+        for msg in sorted(msgs, key=lambda m: m.id):
+            if msg.out:
+                continue
+            url = await find_url(client, msg)          # link / Mini App button
             if url:
                 return url
-
-            if buttons_of(msg):
+            if buttons_of(msg) and msg.id not in seen:  # callback / plain button
+                seen.add(msg.id)
+                await asyncio.sleep(random.uniform(0.8, 2.5))   # "reading" time
                 try:
                     url = await press_button(client, msg)
                     if url:
                         return url
                 except Exception as e:
                     log.warning("Button press failed: %r", e)
-                await asyncio.sleep(random.uniform(1, 2))
-                fresh = await client.get_messages(BOT, ids=msg.id)   # may be edited
-                url = await find_url(client, fresh) if fresh else None
-                if url:
-                    return url
+    log.info("No usable reply from the bot in 40s. Chat now:")
+    await dump_chat(client)
     return None
 
 
@@ -172,10 +256,12 @@ async def main():
     await client.start()          # first run asks phone + code
     log.info("Telegram connected")
     import telethon
-    log.info("Script v6 | Telethon %s", getattr(telethon, "__version__", "?"))
+    log.info("Script v8 | Telethon %s", getattr(telethon, "__version__", "?"))
 
     await client.send_message(BOT, "/start")
     await asyncio.sleep(random.uniform(3, 7))
+    log.info("Chat after /start:")
+    await dump_chat(client)
 
     pw = browser = None
     if HAS_PW:
