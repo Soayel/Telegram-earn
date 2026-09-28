@@ -1,67 +1,248 @@
-import asyncio, os, re, logging
+import asyncio, os, re, random, logging, time, webbrowser, subprocess
+import urllib.request
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from playwright.async_api import async_playwright
+from telethon.errors import FloodWaitError
+from telethon.tl import types, functions
+
+try:
+    from playwright.async_api import async_playwright
+    HAS_PW = True
+except ImportError:          # e.g. Pydroid -> falls back to phone browser
+    HAS_PW = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bot")
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION = os.environ["SESSION"]          # from gen_session.py
-BOT = os.environ["BOT"]                  # e.g. @your_bot
-TEXT = os.environ["TEXT"]                # text to send each round
-DELAY = int(os.environ.get("DELAY", "5"))          # seconds between rounds
-STAY = int(os.environ.get("STAY", "3"))             # seconds to stay on page
+# ---------------- SETTINGS (edit here, or use env variables on Railway) ----
+def cfg(name, default):
+    return os.environ.get(name, default)
+
+API_ID   = int(cfg("API_ID", "0"))          # your api_id
+API_HASH = cfg("API_HASH", "")              # your api_hash
+SESSION  = cfg("SESSION", "")               # leave empty on Pydroid/PC (asks login once)
+BOT      = cfg("BOT", "@your_bot")          # bot username
+TEXT     = cfg("TEXT", "your text")         # text to send
+
+MIN_DELAY   = int(cfg("MIN_DELAY", "5"))   # seconds between rounds (random between)
+MAX_DELAY   = int(cfg("MAX_DELAY", "15"))
+STAY_MIN    = int(cfg("STAY_MIN", "3"))     # seconds to stay on the page
+STAY_MAX    = int(cfg("STAY_MAX", "8"))
+MAX_PER_DAY = int(cfg("MAX_PER_DAY", "500"))  # daily limit
+HEADLESS    = cfg("HEADLESS", "1") == "1"
+PAGE_CLICK_TEXT = cfg("PAGE_CLICK_TEXT", "")   # text of a button INSIDE the mini app to click (e.g. Start)
+BUTTON_TEXT = cfg("BUTTON_TEXT", "")        # exact button label to press; empty = first button
+PHONE_MODE  = cfg("PHONE_MODE", "http")     # "http" = fetch link in code, "phone" = try phone browser
+# ---------------------------------------------------------------------------
+
+
+def open_without_playwright(url):
+    """Used when Playwright is not available (Pydroid)."""
+    if PHONE_MODE == "phone":
+        try:
+            r = subprocess.run(
+                ["am", "start", "-a", "android.intent.action.VIEW", "-d", url],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0 and "Error" not in (r.stdout + r.stderr):
+                log.info("Opened in phone browser")
+                return
+        except Exception as e:
+            log.info("am start failed: %s", e)
+        try:
+            if webbrowser.open(url):
+                log.info("Opened with webbrowser")
+                return
+        except Exception as e:
+            log.info("webbrowser failed: %s", e)
+        log.info("Phone browser failed, using HTTP request instead")
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,*/*",
+        })
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            body = resp.read()
+            log.info("HTTP %s, %d bytes loaded", resp.status, len(body))
+    except Exception as e:
+        log.warning("HTTP load failed: %s", e)
+
+
+async def webview_url(client, raw):
+    """Open a Telegram Mini App button and return the real web URL."""
+    bot = await client.get_input_entity(BOT)
+    theme = types.DataJSON(data='{"bg_color":"#ffffff","text_color":"#000000",'
+                                '"button_color":"#3390ec","button_text_color":"#ffffff"}')
+    try:
+        if isinstance(raw, types.KeyboardButtonWebView):
+            res = await client(functions.messages.RequestWebViewRequest(
+                peer=bot, bot=bot, platform="android", url=raw.url, theme_params=theme))
+        else:
+            res = await client(functions.messages.RequestSimpleWebViewRequest(
+                bot=bot, platform="android", url=raw.url, theme_params=theme))
+        return res.url
+    except Exception as e:
+        log.warning("Mini app request failed: %r", e)
+        return None
+
+
+async def find_url(client, msg):
+    """URL from a link button, a Mini App button, or the message text."""
+    for row in msg.buttons or []:
+        for b in row:
+            raw = b.button
+            if isinstance(raw, types.KeyboardButtonUrl):
+                return raw.url
+            if isinstance(raw, (types.KeyboardButtonWebView,
+                                types.KeyboardButtonSimpleWebView)):
+                if BUTTON_TEXT and BUTTON_TEXT.lower() not in (b.text or "").lower():
+                    continue
+                log.info("Opening Mini App button: %s", b.text)
+                url = await webview_url(client, raw)
+                if url:
+                    return url
+    m = re.search(r"https?://\S+", msg.text or "")
+    return m.group(0) if m else None
 
 
 async def get_link(client):
-    """Send TEXT, wait for reply with a button (or link) and return its URL."""
-    async with client.conversation(BOT, timeout=30) as conv:
+    """Send TEXT, open the Mini App button / press the button, return the URL."""
+    async with client.conversation(BOT, timeout=45) as conv:
+        async with client.action(BOT, "typing"):
+            await asyncio.sleep(random.uniform(0.5, 1.5))
         await conv.send_message(TEXT)
-        for _ in range(5):
-            msg = await conv.get_response()
-            for row in msg.buttons or []:
-                for b in row:
-                    if b.url:
-                        return b.url
-            m = re.search(r"https?://\S+", msg.text or "")
-            if m:
-                return m.group(0)
+        for _ in range(4):
+            try:
+                msg = await conv.get_response()
+            except asyncio.TimeoutError:
+                log.info("Bot sent no (more) messages")
+                break
+            await asyncio.sleep(random.uniform(0.8, 2.5))   # "reading" time
+
+            url = await find_url(client, msg)
+            if url:
+                return url
+
+            if msg.buttons:                              # callback button: press it
+                try:
+                    if BUTTON_TEXT:
+                        log.info("Pressing button: %s", BUTTON_TEXT)
+                        res = await msg.click(text=BUTTON_TEXT)
+                    else:
+                        log.info("Pressing first button")
+                        res = await msg.click(0, 0)
+                    if getattr(res, "url", None):
+                        return res.url
+                except Exception as e:
+                    log.warning("Button click failed: %r", e)
+                await asyncio.sleep(random.uniform(1, 2))
+                fresh = await client.get_messages(BOT, ids=msg.id)   # may be edited
+                url = await find_url(client, fresh) if fresh else None
+                if url:
+                    return url
     return None
 
 
 async def main():
-    client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-    await client.start()
+    session = StringSession(SESSION) if SESSION else "session"
+    client = TelegramClient(session, API_ID, API_HASH)
+    await client.start()          # first run asks phone + code
     log.info("Telegram connected")
 
-    # Start the bot once
     await client.send_message(BOT, "/start")
-    await asyncio.sleep(2)
+    await asyncio.sleep(random.uniform(3, 7))
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+    pw = browser = None
+    if HAS_PW:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=HEADLESS, args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        while True:
-            page = None
+    else:
+        log.info("Playwright not found: using phone/default browser")
+
+    async def open_url(url):
+        stay = random.uniform(STAY_MIN, STAY_MAX)
+        if browser:
+            ctx = await browser.new_context(
+                user_agent=("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"),
+                viewport={"width": 390, "height": 844},
+                is_mobile=True, has_touch=True,
+            )
+            page = await ctx.new_page()
             try:
-                url = await get_link(client)
-                if not url:
-                    log.info("No button/link received, retrying")
-                else:
-                    log.info("Opening %s", url)
-                    page = await browser.new_page()
-                    await page.goto(url, wait_until="load", timeout=60000)
-                    await page.wait_for_timeout(STAY * 1000)
-                    log.info("Page loaded")
-            except Exception as e:
-                log.warning("Error: %s", e)
+                await page.goto(url, wait_until="load", timeout=60000)
+                log.info("Mini app loaded")
+                if PAGE_CLICK_TEXT:
+                    try:
+                        await page.get_by_text(PAGE_CLICK_TEXT, exact=False).first.click(timeout=20000)
+                        log.info("Clicked '%s' inside the page", PAGE_CLICK_TEXT)
+                    except Exception as e:
+                        log.info("Page button not found: %r", e)
+                await page.wait_for_timeout(int(stay * 1000))
             finally:
-                if page:
-                    await page.close()
-            await asyncio.sleep(DELAY)
+                await ctx.close()
+        else:
+            await asyncio.to_thread(open_without_playwright, url)
+            await asyncio.sleep(stay)
+
+    day_start = time.time()
+    today = rounds = floods = 0
+    until_break = random.randint(25, 45)
+
+    while True:
+        # reset the daily counter after 24h; pause if limit reached
+        if time.time() - day_start > 86400:
+            day_start, today = time.time(), 0
+        if today >= MAX_PER_DAY:
+            wait = 86400 - (time.time() - day_start)
+            log.info("Daily limit reached. Sleeping %.1f h", wait / 3600)
+            await asyncio.sleep(max(wait, 60))
+            continue
+
+        try:
+            url = await get_link(client)
+            if url:
+                log.info("Opening %s", url)
+                await open_url(url)
+                today += 1
+                rounds += 1
+                log.info("Done. Today: %d/%d", today, MAX_PER_DAY)
+            else:
+                log.info("No button/link received")
+        except FloodWaitError as e:
+            floods += 1
+            log.warning("FloodWait %ss (%d/3)", e.seconds, floods)
+            if floods >= 3:
+                log.warning("Too many flood waits. Stopping to protect account.")
+                break
+            await asyncio.sleep(e.seconds + random.randint(60, 180))
+            continue
+        except Exception as e:
+            log.warning("Error: %r", e)
+
+        # random pause between rounds
+        # mostly short pauses, occasionally a slightly longer one (like a real person)
+        pause = random.triangular(MIN_DELAY, MAX_DELAY, MIN_DELAY + (MAX_DELAY - MIN_DELAY) * 0.3)
+        if random.random() < 0.08:
+            pause += random.uniform(10, 30)
+        await asyncio.sleep(pause)
+
+        # every 25-45 rounds take a longer "human" break (3-5 min)
+        until_break -= 1
+        if until_break <= 0:
+            br = random.uniform(180, 300)
+            log.info("Taking a break: %.0f min", br / 60)
+            await asyncio.sleep(br)
+            until_break = random.randint(25, 45)
+
+    if browser:
+        await browser.close()
+    if pw:
+        await pw.stop()
+    await client.disconnect()
 
 
 asyncio.run(main())
