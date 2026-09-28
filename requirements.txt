@@ -1,2 +1,2 @@
-telethon
+telethon>=1.36,<2
 playwright==1.47.0
