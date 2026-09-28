@@ -5,10 +5,9 @@ import re
 import time
 from urllib.parse import parse_qs
 
-from telethon import TelegramClient, functions, types
+from telethon import TelegramClient, functions, types, utils as tg_utils
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
-from telethon import utils as tg_utils
 
 
 # ============================================================
@@ -49,14 +48,10 @@ PAGE_CLICK_TEXT = cfg("PAGE_CLICK_TEXT", "")
 
 
 # ============================================================
-# TELEGRAM BUTTON HELPERS
+# BUTTON EXTRACTION
 # ============================================================
 
 def buttons_of(msg):
-    """
-    Extract every raw Telegram button from reply_markup.
-    """
-
     markup = getattr(msg, "reply_markup", None)
 
     if not markup:
@@ -65,19 +60,14 @@ def buttons_of(msg):
     result = []
 
     for row in getattr(markup, "rows", []) or []:
-        for button in getattr(row, "buttons", []) or []:
-            result.append(button)
+        result.extend(
+            getattr(row, "buttons", []) or []
+        )
 
     return result
 
 
 def debug_buttons(msg):
-    """
-    Log the exact Telegram button class.
-
-    This is extremely useful when a Mini App isn't detected.
-    """
-
     buttons = buttons_of(msg)
 
     if not buttons:
@@ -88,7 +78,6 @@ def debug_buttons(msg):
         return
 
     for index, button in enumerate(buttons):
-
         log.info(
             "BUTTON[%d] | type=%s | text=%r | url=%r",
             index,
@@ -99,25 +88,13 @@ def debug_buttons(msg):
 
 
 # ============================================================
-# TEXT / HIDDEN URL EXTRACTION
+# URL EXTRACTION
 # ============================================================
 
 def urls_of(msg):
-    """
-    Extract URLs from:
-      - URL buttons
-      - hidden Telegram text URLs
-      - plain text URLs
-    """
-
     urls = []
 
-    # --------------------------------------------------------
-    # URL buttons
-    # --------------------------------------------------------
-
     for button in buttons_of(msg):
-
         kind = type(button).__name__
 
         if kind in (
@@ -129,59 +106,41 @@ def urls_of(msg):
             if url:
                 urls.append(url)
 
-    # --------------------------------------------------------
-    # Telegram message entities
-    # --------------------------------------------------------
-
     try:
-
         for entity, text in msg.get_entities_text():
-
             kind = type(entity).__name__
 
             if kind == "MessageEntityTextUrl":
-
                 if entity.url:
                     urls.append(entity.url)
 
             elif kind == "MessageEntityUrl":
-
                 if text:
-
-                    if text.startswith(("http://", "https://")):
+                    if text.startswith(
+                        ("http://", "https://")
+                    ):
                         urls.append(text)
-
                     else:
-                        urls.append("https://" + text)
+                        urls.append(
+                            "https://" + text
+                        )
 
     except Exception as exc:
-
         log.debug(
             "Entity URL extraction failed: %s",
             exc,
         )
 
-    # --------------------------------------------------------
-    # Plain text URLs
-    # --------------------------------------------------------
-
-    text = msg.raw_text or ""
-
     urls.extend(
         re.findall(
             r"https?://[^\s<>\]\)]+",
-            text,
+            msg.raw_text or "",
         )
     )
-
-    # --------------------------------------------------------
-    # Deduplicate
-    # --------------------------------------------------------
 
     result = []
 
     for url in urls:
-
         url = url.strip().rstrip(".,;")
 
         if url and url not in result:
@@ -191,7 +150,7 @@ def urls_of(msg):
 
 
 # ============================================================
-# TELEGRAM MINI APP / T.ME LINK RESOLUTION
+# TELEGRAM MINI APP DEEP LINKS
 # ============================================================
 
 TME_RE = re.compile(
@@ -203,12 +162,6 @@ TME_RE = re.compile(
 
 
 async def resolve_url(client, url):
-    """
-    Resolve Telegram Mini App deep links.
-
-    Normal HTTP URLs are returned unchanged.
-    """
-
     match = TME_RE.match(url)
 
     if not match:
@@ -227,11 +180,7 @@ async def resolve_url(client, url):
     )[0]
 
     try:
-
-        # ----------------------------------------------------
         # /bot/app
-        # ----------------------------------------------------
-
         if (
             app
             and not app.isdigit()
@@ -245,51 +194,41 @@ async def resolve_url(client, url):
                 "socks",
             }
         ):
-
             peer = await client.get_input_entity(name)
-
-            bot_id = tg_utils.get_input_user(peer)
 
             result = await client(
                 functions.messages.RequestAppWebViewRequest(
                     peer=peer,
-
                     app=types.InputBotAppShortName(
-                        bot_id=bot_id,
+                        bot_id=tg_utils.get_input_user(
+                            peer
+                        ),
                         short_name=app,
                     ),
-
                     platform="android",
-
                     write_allowed=True,
-
                     start_param=startapp,
                 )
             )
 
             log.info(
-                "Resolved Mini App deep link: %s",
+                "Resolved Mini App: %s",
                 result.url,
             )
 
             return result.url
 
-        # ----------------------------------------------------
-        # /bot?startapp=
-        # ----------------------------------------------------
-
+        # /bot?startapp=...
         if startapp is not None and not app:
-
             peer = await client.get_input_entity(name)
 
             result = await client(
                 functions.messages.RequestMainWebViewRequest(
                     peer=peer,
-
-                    bot=tg_utils.get_input_user(peer),
-
+                    bot=tg_utils.get_input_user(
+                        peer
+                    ),
                     platform="android",
-
                     start_param=startapp or None,
                 )
             )
@@ -302,7 +241,6 @@ async def resolve_url(client, url):
             return result.url
 
     except Exception as exc:
-
         log.exception(
             "Mini App link resolution failed: %s",
             exc,
@@ -316,10 +254,6 @@ async def resolve_url(client, url):
 # ============================================================
 
 async def webview_url(client, button):
-    """
-    Convert a Telegram WebView button into its actual WebView URL.
-    """
-
     bot = await client.get_input_entity(BOT)
 
     theme = types.DataJSON(
@@ -340,58 +274,35 @@ async def webview_url(client, button):
     )
 
     try:
-
-        # ----------------------------------------------------
-        # KeyboardButtonWebView
-        # ----------------------------------------------------
-
         if kind == "KeyboardButtonWebView":
-
             result = await client(
                 functions.messages.RequestWebViewRequest(
                     peer=bot,
-
                     bot=bot,
-
                     platform="android",
-
                     url=button.url,
-
                     theme_params=theme,
                 )
             )
 
             return result.url
 
-        # ----------------------------------------------------
-        # KeyboardButtonSimpleWebView
-        # ----------------------------------------------------
-
         if kind == "KeyboardButtonSimpleWebView":
-
             result = await client(
                 functions.messages.RequestSimpleWebViewRequest(
                     bot=bot,
-
                     platform="android",
-
                     url=button.url,
-
                     theme_params=theme,
                 )
             )
 
             return result.url
-
-        # ----------------------------------------------------
-        # Normal URL button
-        # ----------------------------------------------------
 
         if kind in (
             "KeyboardButtonUrl",
             "KeyboardButtonUrlAuth",
         ):
-
             return getattr(
                 button,
                 "url",
@@ -399,7 +310,6 @@ async def webview_url(client, button):
             )
 
     except Exception as exc:
-
         log.exception(
             "WebView resolution failed: %s",
             exc,
@@ -413,30 +323,15 @@ async def webview_url(client, button):
 # ============================================================
 
 async def callback_button_url(client, msg, button):
-    """
-    Press a Telegram callback button and inspect the callback answer.
-
-    A bot can return a Mini App URL from the callback answer rather
-    than placing the URL directly inside the keyboard.
-    """
-
     bot = await client.get_input_entity(BOT)
 
     try:
-
         result = await client(
             functions.messages.GetBotCallbackAnswerRequest(
                 peer=bot,
-
                 msg_id=msg.id,
-
                 data=button.data,
             )
-        )
-
-        log.info(
-            "Callback response type=%s",
-            type(result).__name__,
         )
 
         url = getattr(
@@ -446,7 +341,6 @@ async def callback_button_url(client, msg, button):
         )
 
         if url:
-
             log.info(
                 "Callback returned URL: %s",
                 url,
@@ -454,18 +348,14 @@ async def callback_button_url(client, msg, button):
 
             return url
 
-        # Some responses may expose an update/message-like
-        # structure containing additional information.
-        log.debug(
-            "Callback response: %r",
-            result,
+        log.info(
+            "Callback returned no URL."
         )
 
     except FloodWaitError:
         raise
 
     except Exception as exc:
-
         log.exception(
             "Callback button failed: %s",
             exc,
@@ -475,69 +365,19 @@ async def callback_button_url(client, msg, button):
 
 
 # ============================================================
-# NORMAL KEYBOARD BUTTON
-# ============================================================
-
-async def normal_button(client, button):
-
-    text = getattr(
-        button,
-        "text",
-        None,
-    )
-
-    if not text:
-        return None
-
-    log.info(
-        "Sending normal keyboard button: %r",
-        text,
-    )
-
-    try:
-
-        await client.send_message(
-            BOT,
-            text,
-        )
-
-    except Exception as exc:
-
-        log.warning(
-            "Normal button failed: %s",
-            exc,
-        )
-
-    return None
-
-
-# ============================================================
-# FIND MINI APP
+# FIND URL
 # ============================================================
 
 async def find_url(client, msg):
-    """
-    Complete button discovery pipeline.
-    """
-
-    log.info(
-        "Inspecting message id=%s text=%r",
-        msg.id,
-        (msg.raw_text or "")[:150],
-    )
-
-    # VERY IMPORTANT:
-    # First print exactly what Telegram sent.
     debug_buttons(msg)
 
     buttons = buttons_of(msg)
 
-    # ========================================================
-    # 1. MINI APP / WEBVIEW BUTTONS
-    # ========================================================
+    # --------------------------------------------------------
+    # 1. Mini App / WebView
+    # --------------------------------------------------------
 
     for button in buttons:
-
         kind = type(button).__name__
 
         text = (
@@ -546,7 +386,6 @@ async def find_url(client, msg):
         )
 
         if BUTTON_TEXT:
-
             if BUTTON_TEXT.lower() not in text.lower():
                 continue
 
@@ -554,7 +393,6 @@ async def find_url(client, msg):
             "KeyboardButtonWebView",
             "KeyboardButtonSimpleWebView",
         ):
-
             log.info(
                 "Mini App button found: %r",
                 text,
@@ -566,36 +404,28 @@ async def find_url(client, msg):
             )
 
             if url:
-
-                log.info(
-                    "Mini App WebView URL obtained."
-                )
-
                 return url
 
-    # ========================================================
-    # 2. NORMAL URL BUTTON
-    # ========================================================
+    # --------------------------------------------------------
+    # 2. Normal URL button
+    # --------------------------------------------------------
 
     for button in buttons:
-
         kind = type(button).__name__
+
+        text = (
+            getattr(button, "text", "")
+            or ""
+        )
+
+        if BUTTON_TEXT:
+            if BUTTON_TEXT.lower() not in text.lower():
+                continue
 
         if kind in (
             "KeyboardButtonUrl",
             "KeyboardButtonUrlAuth",
         ):
-
-            text = (
-                getattr(button, "text", "")
-                or ""
-            )
-
-            if BUTTON_TEXT:
-
-                if BUTTON_TEXT.lower() not in text.lower():
-                    continue
-
             url = getattr(
                 button,
                 "url",
@@ -603,7 +433,6 @@ async def find_url(client, msg):
             )
 
             if url:
-
                 log.info(
                     "URL button found: %s",
                     url,
@@ -611,12 +440,11 @@ async def find_url(client, msg):
 
                 return url
 
-    # ========================================================
-    # 3. CALLBACK BUTTON
-    # ========================================================
+    # --------------------------------------------------------
+    # 3. Callback button
+    # --------------------------------------------------------
 
     for button in buttons:
-
         kind = type(button).__name__
 
         if kind != "KeyboardButtonCallback":
@@ -628,7 +456,6 @@ async def find_url(client, msg):
         )
 
         if BUTTON_TEXT:
-
             if BUTTON_TEXT.lower() not in text.lower():
                 continue
 
@@ -646,12 +473,11 @@ async def find_url(client, msg):
         if url:
             return url
 
-    # ========================================================
-    # 4. TEXT / HIDDEN URL
-    # ========================================================
+    # --------------------------------------------------------
+    # 4. Hidden/text URLs
+    # --------------------------------------------------------
 
     for url in urls_of(msg):
-
         resolved = await resolve_url(
             client,
             url,
@@ -668,15 +494,14 @@ async def find_url(client, msg):
 # ============================================================
 
 async def get_link(client):
-
-    log.info(
-        "Sending: %r",
-        TEXT,
-    )
-
     sent = await client.send_message(
         BOT,
         TEXT,
+    )
+
+    log.info(
+        "Sent message id=%s",
+        sent.id,
     )
 
     deadline = (
@@ -687,7 +512,6 @@ async def get_link(client):
     checked = set()
 
     while time.monotonic() < deadline:
-
         await asyncio.sleep(1)
 
         messages = await client.get_messages(
@@ -699,13 +523,9 @@ async def get_link(client):
             messages,
             key=lambda item: item.id,
         ):
-
-            # Ignore our own messages.
             if msg.out:
                 continue
 
-            # Avoid repeatedly processing
-            # the exact same message.
             if msg.id in checked:
                 continue
 
@@ -720,81 +540,10 @@ async def get_link(client):
                 return url
 
     log.warning(
-        "No Mini App URL found within %.1f seconds.",
-        RESPONSE_TIMEOUT,
+        "No usable Mini App URL found."
     )
 
     return None
-
-
-# ============================================================
-# OPTIONAL PLAYWRIGHT
-# ============================================================
-
-async def open_webview(browser, url):
-
-    context = await browser.new_context(
-        viewport={
-            "width": 390,
-            "height": 844,
-        },
-
-        is_mobile=True,
-
-        has_touch=True,
-    )
-
-    page = await context.new_page()
-
-    try:
-
-        log.info(
-            "Opening WebView..."
-        )
-
-        await page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
-
-        log.info(
-            "WebView loaded: %s",
-            page.url,
-        )
-
-        if PAGE_CLICK_TEXT:
-
-            try:
-
-                locator = page.get_by_text(
-                    PAGE_CLICK_TEXT,
-                    exact=False,
-                ).first
-
-                await locator.click(
-                    timeout=15_000,
-                )
-
-                log.info(
-                    "Clicked page element: %r",
-                    PAGE_CLICK_TEXT,
-                )
-
-            except Exception as exc:
-
-                log.warning(
-                    "Page click failed: %s",
-                    exc,
-                )
-
-        await page.wait_for_timeout(
-            3_000
-        )
-
-    finally:
-
-        await context.close()
 
 
 # ============================================================
@@ -818,10 +567,6 @@ async def main():
             "BOT is missing."
         )
 
-    # --------------------------------------------------------
-    # Session
-    # --------------------------------------------------------
-
     session = (
         StringSession(SESSION)
         if SESSION
@@ -834,11 +579,7 @@ async def main():
         API_HASH,
     )
 
-    browser = None
-    playwright = None
-
     try:
-
         log.info(
             "Connecting to Telegram..."
         )
@@ -849,48 +590,10 @@ async def main():
             "Telegram connection established."
         )
 
-        # ----------------------------------------------------
-        # Optional Playwright
-        # ----------------------------------------------------
-
-        if (
-            HEADLESS
-            and PAGE_CLICK_TEXT
-        ):
-
-            try:
-
-                from playwright.async_api import (
-                    async_playwright,
-                )
-
-                playwright = (
-                    await async_playwright().start()
-                )
-
-                browser = await playwright.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
-                )
-
-            except ImportError:
-
-                log.warning(
-                    "Playwright is not installed."
-                )
-
-        # ----------------------------------------------------
-        # Main loop
-        # ----------------------------------------------------
-
         for round_number in range(
             1,
             MAX_ROUNDS + 1,
         ):
-
             log.info(
                 "========== ROUND %d/%d ==========",
                 round_number,
@@ -898,29 +601,57 @@ async def main():
             )
 
             try:
-
                 url = await get_link(
                     client
                 )
 
-                if not url:
-
-                    log.warning(
-                        "No usable Mini App URL found."
-                    )
-
-                else:
-
+                if url:
                     log.info(
-                        "FOUND URL: %s",
+                        "FOUND MINI APP URL: %s",
                         url,
                     )
+                else:
+                    log.warning(
+                        "Mini App URL was not found."
+                    )
 
-                    if browser:
+            except FloodWaitError as exc:
+                log.warning(
+                    "Telegram FloodWait: %s seconds",
+                    exc.seconds,
+                )
 
-                        await open_webview(
-                            browser,
-                            url,
-                        )
+                await asyncio.sleep(
+                    exc.seconds
+                )
 
-   
+            except Exception:
+                log.exception(
+                    "Round failed."
+                )
+
+            if round_number < MAX_ROUNDS:
+                await asyncio.sleep(
+                    ROUND_DELAY
+                )
+
+    finally:
+        await client.disconnect()
+
+        log.info(
+            "Disconnected."
+        )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        log.info(
+            "Stopped by user."
+    )
